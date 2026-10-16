@@ -1,7 +1,11 @@
 import io
 import re
 import difflib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import quote
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -83,7 +87,8 @@ DEFAULT_SHEET_URL = st.secrets.get(
     "https://docs.google.com/spreadsheets/d/1Mx-GVqqiznd_etK9pyygYd4uym0qfawCU_Rs-F5vbrk/edit?usp=sharing",
 )
 
-TARGET_SHEETS_RAW = [
+# Exact 20 target sheets from the workbook
+TARGET_SHEETS = [
     "4702 NT_N",
     "4702_MOT_N",
     "4702 _APB_N",
@@ -207,7 +212,6 @@ def normalize_cp_cf(val) -> str:
 
 
 def normalize_sf(val) -> str:
-    """Normalizes S/F column values (case-insensitive and space-trimmed)."""
     s = clean_text(val)
     if not s:
         return "N/A"
@@ -286,13 +290,6 @@ def extract_sheet_id(url_or_id: str) -> str:
     if match:
         return match.group(1)
     return url_or_id
-
-
-def normalize_sheet_key(name: str) -> str:
-    s = re.sub(r"!.*$", "", str(name))
-    s = s.strip("'\" ")
-    s = re.sub(r"\s+", " ", s)
-    return s.lower()
 
 
 def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
@@ -456,52 +453,90 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     return std_df
 
 
-# No TTL timer: Data stays cached until user manually clicks the Load button
+# ==============================================================================
+# 4. FAST PARALLEL SHEET FETCHER (AVOIDS WORKBOOK EXPORT TIMEOUT)
+# ==============================================================================
+def create_retry_session() -> requests.Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        read=3,
+        connect=3,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def fetch_single_sheet_csv(
+    session: requests.Session, sheet_id: str, sheet_name: str
+) -> tuple[str, pd.DataFrame | None, str | None]:
+    """
+    Downloads a single sheet as CSV using Google's fast gviz endpoint.
+    Tries exact sheet name first, then stripped sheet name as fallback.
+    """
+    candidates = [sheet_name]
+    if sheet_name.strip() != sheet_name:
+        candidates.append(sheet_name.strip())
+
+    last_err = None
+    for candidate_name in candidates:
+        encoded_name = quote(candidate_name)
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_name}"
+        try:
+            resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            text_data = resp.content.decode("utf-8", errors="replace")
+            if text_data.lstrip().startswith("<!DOCTYPE html"):
+                last_err = "Sheet not publicly accessible or invalid response"
+                continue
+            raw_df = pd.read_csv(io.StringIO(text_data), header=None, dtype=str)
+            parsed_df = parse_single_sheet(raw_df, sheet_name.strip())
+            return sheet_name.strip(), parsed_df, None
+        except Exception as e:
+            last_err = str(e)
+
+    return sheet_name.strip(), None, last_err
+
+
+# Cached without TTL so it works strictly as a manual snapshot
 @st.cache_data(show_spinner=False)
 def fetch_and_process_workbook(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[str]]:
     sheet_id = extract_sheet_id(sheet_url)
-    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-
-    response = requests.get(export_url, timeout=90)
-    response.raise_for_status()
-
-    excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
-    available_map = {normalize_sheet_key(name): name for name in excel_file.sheet_names}
+    session = create_retry_session()
 
     loaded_frames = []
     loaded_sheets = []
     missing_sheets = []
 
-    for target in TARGET_SHEETS_RAW:
-        norm_key = normalize_sheet_key(target)
-        actual_name = available_map.get(norm_key)
-
-        if actual_name is None:
-            compact_target = re.sub(r"[\s_]+", "", norm_key)
-            for avail_norm, avail_orig in available_map.items():
-                if re.sub(r"[\s_]+", "", avail_norm) == compact_target:
-                    actual_name = avail_orig
-                    break
-
-        if actual_name is not None:
-            raw_sheet_df = pd.read_excel(excel_file, sheet_name=actual_name, header=None)
-            parsed_df = parse_single_sheet(raw_sheet_df, actual_name)
-            if not parsed_df.empty:
-                loaded_frames.append(parsed_df)
-            loaded_sheets.append(actual_name)
-        else:
-            missing_sheets.append(target)
+    # Fetch all 20 target sheets concurrently (skips the huge 9000-row DYNAMIC sheets)
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_sheet = {
+            executor.submit(fetch_single_sheet_csv, session, sheet_id, s_name): s_name
+            for s_name in TARGET_SHEETS
+        }
+        for future in as_completed(future_to_sheet):
+            s_name, parsed_df, err = future.result()
+            if parsed_df is not None:
+                loaded_sheets.append(s_name)
+                if not parsed_df.empty:
+                    loaded_frames.append(parsed_df)
+            else:
+                missing_sheets.append(f"{s_name} ({err})")
 
     if loaded_frames:
         combined_df = pd.concat(loaded_frames, ignore_index=True)
     else:
         combined_df = pd.DataFrame()
 
-    return combined_df, loaded_sheets, missing_sheets
+    return combined_df, sorted(loaded_sheets), missing_sheets
 
 
 # ==============================================================================
-# 4. MAIN APPLICATION UI (MANUAL LOAD ONLY)
+# 5. MAIN APPLICATION UI (MANUAL SNAPSHOT LOAD)
 # ==============================================================================
 def main():
     st.markdown(
@@ -524,9 +559,8 @@ def main():
             value=DEFAULT_SHEET_URL,
         )
 
-        # Manual Load / Refresh Button
         manual_load_clicked = st.button(
-            "🔄 ಡೇಟಾ ಲೋಡ್ / ರಿಫ್ರೆಶ್ ಮಾಡಿ (15-20s)",
+            "🔄 ಡೇಟಾ ಲೋಡ್ / ರಿಫ್ರೆಶ್ ಮಾಡಿ (5-10s)",
             type="primary",
             use_container_width=True,
         )
@@ -543,14 +577,14 @@ def main():
 
     if not st.session_state.data_loaded:
         st.info(
-            "👆 ಡ್ಯಾಶ್‌ಬೋರ್ಡ್ ವೀಕ್ಷಿಸಲು ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಅಥವಾ ಎಡಭಾಗದ **'🔄 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ (15-20s)'** ಬಟನ್ ಒತ್ತಿ."
+            "👆 ಡ್ಯಾಶ್‌ಬೋರ್ಡ್ ವೀಕ್ಷಿಸಲು ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಅಥವಾ ಎಡಭಾಗದ **'🔄 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ'** ಬಟನ್ ಒತ್ತಿ."
         )
-        if st.button("📥 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ (15-20 ಸೆಕೆಂಡುಗಳು)", type="primary"):
+        if st.button("📥 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ (5-10 ಸೆಕೆಂಡುಗಳು)", type="primary"):
             st.session_state.data_loaded = True
             st.rerun()
         st.stop()
 
-    with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ 20 ಶೀಟ್‌ಗಳ ಡೇಟಾವನ್ನು ಲೋಡ್ ಮಾಡಲಾಗುತ್ತಿದೆ (15-20 ಸೆಕೆಂಡುಗಳು)..."):
+    with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ 20 ಶೀಟ್‌ಗಳ ಡೇಟಾವನ್ನು ವೇಗವಾಗಿ ಲೋಡ್ ಮಾಡಲಾಗುತ್ತಿದೆ (5-10 ಸೆಕೆಂಡುಗಳು)..."):
         try:
             df, loaded_sheets, missing_sheets = fetch_and_process_workbook(sheet_url_input)
         except Exception as e:
@@ -562,7 +596,7 @@ def main():
         st.stop()
 
     # ==========================================================================
-    # 5. SIDEBAR FILTERS
+    # 6. SIDEBAR FILTERS
     # ==========================================================================
     st.sidebar.markdown("---")
     st.sidebar.header("🔍 ಫಿಲ್ಟರ್‌ಗಳು")
@@ -621,7 +655,7 @@ def main():
         filtered_df = filtered_df[range_mask]
 
     # ==========================================================================
-    # 6. KPI METRIC CARDS (9 REQUIRED VALUES)
+    # 7. KPI METRIC CARDS (9 REQUIRED VALUES)
     # ==========================================================================
     is_crores = "ಕೋಟಿ" in unit_mode
     divisor = 100.0 if is_crores else 1.0
@@ -704,7 +738,7 @@ def main():
     st.markdown("---")
 
     # ==========================================================================
-    # 7. TABS: DIVISION ABSTRACT, CHARTS & DETAILED DATA
+    # 8. TABS: DIVISION ABSTRACT, CHARTS & DETAILED DATA
     # ==========================================================================
     tab1, tab2, tab3, tab4 = st.tabs(
         [
