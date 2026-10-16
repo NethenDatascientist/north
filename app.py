@@ -1,11 +1,7 @@
 import io
 import re
 import difflib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import quote
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -87,7 +83,6 @@ DEFAULT_SHEET_URL = st.secrets.get(
     "https://docs.google.com/spreadsheets/d/1Mx-GVqqiznd_etK9pyygYd4uym0qfawCU_Rs-F5vbrk/edit?usp=sharing",
 )
 
-# Exact 20 target sheets from the workbook
 TARGET_SHEETS = [
     "4702 NT_N",
     "4702_MOT_N",
@@ -149,7 +144,6 @@ ESTIMATE_RANGES = {
     "Less than 1CR : < 100": lambda s: s < 100,
 }
 
-# Canonical Column Names
 COL_SF = "S/F"
 COL_PROGRESS = "PROGRESS STATUS (CP/CF)"
 COL_HEAD = "ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ"
@@ -179,7 +173,7 @@ FINANCIAL_COLUMNS = [
 ]
 
 # ==============================================================================
-# 3. HELPER FUNCTIONS FOR FUZZY MATCHING & NORMALIZATION
+# 3. HELPER FUNCTIONS
 # ==============================================================================
 def clean_text(val) -> str:
     if pd.isna(val):
@@ -191,12 +185,6 @@ def clean_text(val) -> str:
 
 
 def normalize_cp_cf(val) -> str:
-    """
-    Normalizes CP/CF column values:
-    - Converts 'p' and 'P' -> 'P'
-    - Converts 'C F', 'c f', 'C-F' -> 'CF'
-    - Converts 'C P', 'c p', 'C-P' -> 'CP'
-    """
     s = clean_text(val)
     if not s:
         return "N/A"
@@ -300,35 +288,20 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
         c_nospace = c_clean.replace(" ", "")
         c_upper = c_clean.upper()
 
-        # 1. S/F Filter Column
         if re.search(r"\bS\s*/\s*F\b", c_upper) or c_upper == "S/F":
             col_mapping.setdefault(COL_SF, col)
-
-        # 2. Progress Status (CP/CF pattern)
         elif "CP/CF" in c_upper or re.search(r"CP\s*/\s*CF", c_upper):
             col_mapping.setdefault(COL_PROGRESS, col)
-
-        # 3. ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ
         elif "ಲೆಕ್ಕಶೀರ್ಷಿಕೆ" in c_nospace or "ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ" in c_clean:
             col_mapping.setdefault(COL_HEAD, col)
-
-        # 4. ವಿಭಾಗದ ಹೆಸರು
         elif "ವಿಭಾಗದಹೆಸರು" in c_nospace or c_clean == "ವಿಭಾಗ":
             col_mapping.setdefault(COL_DIVISION, col)
-
-        # 5. ಜಿಲ್ಲೆ
         elif c_nospace == "ಜಿಲ್ಲೆ" or "ಜಿಲ್ಲೆಯಹೆಸರು" in c_nospace:
             col_mapping.setdefault(COL_DISTRICT, col)
-
-        # 6. ತಾಲ್ಲೂಕು
         elif c_nospace in ["ತಾಲ್ಲೂಕು", "ತಾಲೂಕು"]:
             col_mapping.setdefault(COL_TALUK, col)
-
-        # 7. ಮತಕ್ಷೇತ್ರ
         elif "ಮತಕ್ಷೇತ್ರ" in c_nospace:
             col_mapping.setdefault(COL_CONSTITUENCY, col)
-
-        # 8. Financial Columns
         elif "ಮೂಲಅಂದಾಜುಮೊತ್ತ" in c_nospace:
             col_mapping.setdefault(COL_EST_AMT, col)
         elif "ಗುತ್ತಿಗೆಮೊತ್ತ" in c_nospace:
@@ -423,23 +396,19 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
     std_df = detect_and_map_columns(df, sheet_name)
 
-    # Filter only the 8 valid divisions (with typo tolerance)
     std_df[COL_DIVISION] = std_df[COL_DIVISION].apply(match_division)
     std_df = std_df[std_df[COL_DIVISION].notna()].copy()
 
     if std_df.empty:
         return std_df
 
-    # Normalize CP/CF ('p' -> 'P', 'C F' -> 'CF') and S/F
     std_df[COL_PROGRESS] = std_df[COL_PROGRESS].apply(normalize_cp_cf)
     std_df[COL_SF] = std_df[COL_SF].apply(normalize_sf)
 
-    # Clean other text filter columns
     for text_col in [COL_HEAD, COL_DISTRICT, COL_TALUK, COL_CONSTITUENCY]:
         std_df[text_col] = std_df[text_col].apply(clean_text)
         std_df[text_col] = std_df[text_col].replace("", "N/A")
 
-    # Convert financial columns to numeric
     for fin_col in FINANCIAL_COLUMNS:
         cleaned_num = (
             std_df[fin_col]
@@ -454,78 +423,44 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 4. FAST PARALLEL SHEET FETCHER (AVOIDS WORKBOOK EXPORT TIMEOUT)
+# 4. ROBUST SINGLE-REQUEST WORKBOOK LOADER (NO TIMEOUTS)
 # ==============================================================================
-def create_retry_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        read=3,
-        connect=3,
-        backoff_factor=1.0,
-        status_forcelist=[429, 500, 502, 503, 504],
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
-
-def fetch_single_sheet_csv(
-    session: requests.Session, sheet_id: str, sheet_name: str
-) -> tuple[str, pd.DataFrame | None, str | None]:
-    """
-    Downloads a single sheet as CSV using Google's fast gviz endpoint.
-    Tries exact sheet name first, then stripped sheet name as fallback.
-    """
-    candidates = [sheet_name]
-    if sheet_name.strip() != sheet_name:
-        candidates.append(sheet_name.strip())
-
-    last_err = None
-    for candidate_name in candidates:
-        encoded_name = quote(candidate_name)
-        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_name}"
-        try:
-            resp = session.get(url, timeout=30)
-            resp.raise_for_status()
-            text_data = resp.content.decode("utf-8", errors="replace")
-            if text_data.lstrip().startswith("<!DOCTYPE html"):
-                last_err = "Sheet not publicly accessible or invalid response"
-                continue
-            raw_df = pd.read_csv(io.StringIO(text_data), header=None, dtype=str)
-            parsed_df = parse_single_sheet(raw_df, sheet_name.strip())
-            return sheet_name.strip(), parsed_df, None
-        except Exception as e:
-            last_err = str(e)
-
-    return sheet_name.strip(), None, last_err
-
-
-# Cached without TTL so it works strictly as a manual snapshot
 @st.cache_data(show_spinner=False)
 def fetch_and_process_workbook(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[str]]:
     sheet_id = extract_sheet_id(sheet_url)
-    session = create_retry_session()
+    
+    # Download the workbook directly as xlsx once with a generous timeout
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    
+    response = requests.get(export_url, timeout=45)
+    response.raise_for_status()
+
+    excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
+    available_map = {str(name).strip().lower(): name for name in excel_file.sheet_names}
 
     loaded_frames = []
     loaded_sheets = []
     missing_sheets = []
 
-    # Fetch all 20 target sheets concurrently (skips the huge 9000-row DYNAMIC sheets)
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_sheet = {
-            executor.submit(fetch_single_sheet_csv, session, sheet_id, s_name): s_name
-            for s_name in TARGET_SHEETS
-        }
-        for future in as_completed(future_to_sheet):
-            s_name, parsed_df, err = future.result()
-            if parsed_df is not None:
-                loaded_sheets.append(s_name)
-                if not parsed_df.empty:
-                    loaded_frames.append(parsed_df)
-            else:
-                missing_sheets.append(f"{s_name} ({err})")
+    for target in TARGET_SHEETS:
+        norm_key = target.strip().lower()
+        actual_name = available_map.get(norm_key)
+
+        if actual_name is None:
+            compact_target = re.sub(r"[\s_]+", "", norm_key)
+            for avail_norm, avail_orig in available_map.items():
+                if re.sub(r"[\s_]+", "", avail_norm) == compact_target:
+                    actual_name = avail_orig
+                    break
+
+        if actual_name is not None:
+            raw_sheet_df = pd.read_excel(excel_file, sheet_name=actual_name, header=None)
+            parsed_df = parse_single_sheet(raw_sheet_df, actual_name)
+            if not parsed_df.empty:
+                loaded_frames.append(parsed_df)
+            loaded_sheets.append(actual_name)
+        else:
+            missing_sheets.append(target)
 
     if loaded_frames:
         combined_df = pd.concat(loaded_frames, ignore_index=True)
@@ -536,7 +471,7 @@ def fetch_and_process_workbook(sheet_url: str) -> tuple[pd.DataFrame, list[str],
 
 
 # ==============================================================================
-# 5. MAIN APPLICATION UI (MANUAL SNAPSHOT LOAD)
+# 5. MAIN APPLICATION UI
 # ==============================================================================
 def main():
     st.markdown(
@@ -560,7 +495,7 @@ def main():
         )
 
         manual_load_clicked = st.button(
-            "🔄 ಡೇಟಾ ಲೋಡ್ / ರಿಫ್ರೆಶ್ ಮಾಡಿ (5-10s)",
+            "🔄 ಡೇಟಾ ಲೋಡ್ / ರಿಫ್ರೆಶ್ಟ್ ಮಾಡಿ",
             type="primary",
             use_container_width=True,
         )
@@ -579,12 +514,12 @@ def main():
         st.info(
             "👆 ಡ್ಯಾಶ್‌ಬೋರ್ಡ್ ವೀಕ್ಷಿಸಲು ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಅಥವಾ ಎಡಭಾಗದ **'🔄 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ'** ಬಟನ್ ಒತ್ತಿ."
         )
-        if st.button("📥 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ (5-10 ಸೆಕೆಂಡುಗಳು)", type="primary"):
+        if st.button("📥 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ", type="primary"):
             st.session_state.data_loaded = True
             st.rerun()
         st.stop()
 
-    with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ 20 ಶೀಟ್‌ಗಳ ಡೇಟಾವನ್ನು ವೇಗವಾಗಿ ಲೋಡ್ ಮಾಡಲಾಗುತ್ತಿದೆ (5-10 ಸೆಕೆಂಡುಗಳು)..."):
+    with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ ಡೇಟಾ ಲೋಡ್ ಮಾಡಲಾಗುತ್ತಿದೆ..."):
         try:
             df, loaded_sheets, missing_sheets = fetch_and_process_workbook(sheet_url_input)
         except Exception as e:
@@ -612,20 +547,10 @@ def main():
             return data[data[col_name].isin(selected)]
         return data
 
-    # 1. S / F FILTER
     filtered_df = apply_multiselect_filter(filtered_df, COL_SF, "1. S / F FILTER")
+    filtered_df = apply_multiselect_filter(filtered_df, COL_PROGRESS, "2. PROGRESS STATUS FILTER (CP/CF)")
+    filtered_df = apply_multiselect_filter(filtered_df, COL_HEAD, "3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER")
 
-    # 2. PROGRESS STATUS FILTER (CP/CF)
-    filtered_df = apply_multiselect_filter(
-        filtered_df, COL_PROGRESS, "2. PROGRESS STATUS FILTER (CP/CF)"
-    )
-
-    # 3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER
-    filtered_df = apply_multiselect_filter(
-        filtered_df, COL_HEAD, "3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER"
-    )
-
-    # 4. ವಿಭಾಗ FILTER
     avail_divisions = [d for d in VALID_DIVISIONS if d in filtered_df[COL_DIVISION].unique()]
     sel_divisions = st.sidebar.multiselect(
         "4. ವಿಭಾಗ FILTER (ವಿಭಾಗದ ಹೆಸರು)", options=avail_divisions, default=[]
@@ -633,16 +558,10 @@ def main():
     if sel_divisions:
         filtered_df = filtered_df[filtered_df[COL_DIVISION].isin(sel_divisions)]
 
-    # 5. ಜಿಲ್ಲೆ FILTER
     filtered_df = apply_multiselect_filter(filtered_df, COL_DISTRICT, "5. ಜಿಲ್ಲೆ FILTER")
-
-    # 6. ತಾಲ್ಲೂಕು FILTER
     filtered_df = apply_multiselect_filter(filtered_df, COL_TALUK, "6. ತಾಲ್ಲೂಕು FILTER")
-
-    # 7. ಮತಕ್ಷೇತ್ರ FILTER
     filtered_df = apply_multiselect_filter(filtered_df, COL_CONSTITUENCY, "7. ಮತಕ್ಷೇತ್ರ FILTER")
 
-    # 8. ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ (RANGE) FILTER
     sel_ranges = st.sidebar.multiselect(
         "8. ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ (RANGE) FILTER",
         options=list(ESTIMATE_RANGES.keys()),
@@ -655,7 +574,7 @@ def main():
         filtered_df = filtered_df[range_mask]
 
     # ==========================================================================
-    # 7. KPI METRIC CARDS (9 REQUIRED VALUES)
+    # 7. KPI METRIC CARDS
     # ==========================================================================
     is_crores = "ಕೋಟಿ" in unit_mode
     divisor = 100.0 if is_crores else 1.0
@@ -668,54 +587,14 @@ def main():
 
     kpi_items = [
         ("ಒಟ್ಟು ಕಾಮಗಾರಿಗಳ ಸಂಖ್ಯೆ", f"{total_works:,}", "ಒಟ್ಟು ಕಾಮಗಾರಿಗಳು", True),
-        (
-            "ಒಟ್ಟು ಅಂದಾಜು ಮೊತ್ತ",
-            f"₹ {sums[COL_EST_AMT]:,.2f}",
-            f"ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ ({unit_suffix})",
-            False,
-        ),
-        (
-            "ಗುತ್ತಿಗೆ ಮೊತ್ತ (ಜಿ.ಎಸ್.ಟಿ ಸೇರಿದಂತೆ)",
-            f"₹ {sums[COL_TENDER_AMT]:,.2f}",
-            f"ಗುತ್ತಿಗೆ ಮೊತ್ತ ({unit_suffix})",
-            False,
-        ),
-        (
-            "ಪರಿಷ್ಕೃತ ಅಂದಾಜು ಮೊತ್ತ (ಜಿ.ಎಸ್.ಟಿ ಸೇರಿದಂತೆ)",
-            f"₹ {sums[COL_REV_EST_AMT]:,.2f}",
-            f"ಪರಿಷ್ಕೃತ ಅಂದಾಜು ಮೊತ್ತ ({unit_suffix})",
-            False,
-        ),
-        (
-            "ಮಾರ್ಚ್ 2026 ವರೆಗಿನ ವೆಚ್ಚ",
-            f"₹ {sums[COL_EXP_MAR26]:,.2f}",
-            f"ಮಾರ್ಚ-2026 ವರೆಗಿನ ವೆಚ್ಚ ({unit_suffix})",
-            False,
-        ),
-        (
-            "2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ",
-            f"₹ {sums[COL_EXP_26_27]:,.2f}",
-            f"2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ ({unit_suffix})",
-            False,
-        ),
-        (
-            "ಒಟ್ಟಾರೆ ವೆಚ್ಚ",
-            f"₹ {sums[COL_TOTAL_EXP]:,.2f}",
-            f"ಒಟ್ಟಾರೆ ವೆಚ್ಚ ({unit_suffix})",
-            False,
-        ),
-        (
-            "ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ",
-            f"₹ {sums[COL_PENDING_BILL]:,.2f}",
-            f"ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ ({unit_suffix})",
-            False,
-        ),
-        (
-            "ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ",
-            f"₹ {sums[COL_BAL_REQ]:,.2f}",
-            f"ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ (17-25) ({unit_suffix})",
-            False,
-        ),
+        ("ಒಟ್ಟು ಅಂದಾಜು ಮೊತ್ತ", f"₹ {sums[COL_EST_AMT]:,.2f}", f"ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ ({unit_suffix})", False),
+        ("ಗುತ್ತಿಗೆ ಮೊತ್ತ (ಜಿ.ಎಸ್.ಟಿ ಸೇರಿದಂತೆ)", f"₹ {sums[COL_TENDER_AMT]:,.2f}", f"ಗುತ್ತಿಗೆ ಮೊತ್ತ ({unit_suffix})", False),
+        ("ಪರಿಷ್ಕೃತ ಅಂದಾಜು ಮೊತ್ತ (ಜಿ.ಎಸ್.ಟಿ ಸೇರಿದಂತೆ)", f"₹ {sums[COL_REV_EST_AMT]:,.2f}", f"ಪರಿಷ್ಕೃತ ಅಂದಾಜು ಮೊತ್ತ ({unit_suffix})", False),
+        ("ಮಾರ್ಚ್ 2026 ವರೆಗಿನ ವೆಚ್ಚ", f"₹ {sums[COL_EXP_MAR26]:,.2f}", f"ಮಾರ್ಚ-2026 ವರೆಗಿನ ವೆಚ್ಚ ({unit_suffix})", False),
+        ("2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ", f"₹ {sums[COL_EXP_26_27]:,.2f}", f"2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ ({unit_suffix})", False),
+        ("ಒಟ್ಟಾರೆ ವೆಚ್ಚ", f"₹ {sums[COL_TOTAL_EXP]:,.2f}", f"ಒಟ್ಟಾರೆ ವೆಚ್ಚ ({unit_suffix})", False),
+        ("ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ", f"₹ {sums[COL_PENDING_BILL]:,.2f}", f"ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ ({unit_suffix})", False),
+        ("ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ", f"₹ {sums[COL_BAL_REQ]:,.2f}", f"ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ (17-25) ({unit_suffix})", False),
     ]
 
     for row_start in range(0, 9, 3):
@@ -738,7 +617,7 @@ def main():
     st.markdown("---")
 
     # ==========================================================================
-    # 8. TABS: DIVISION ABSTRACT, CHARTS & DETAILED DATA
+    # 8. TABS
     # ==========================================================================
     tab1, tab2, tab3, tab4 = st.tabs(
         [
