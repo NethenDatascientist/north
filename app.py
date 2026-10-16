@@ -11,7 +11,7 @@ import plotly.express as px
 # 1. PAGE CONFIGURATION & CUSTOM STYLING
 # ==============================================================================
 st.set_page_config(
-    page_title="ಕಾಮಗಾರಿಗಳ ಪ್ರಗತಿ ವರದಿ | Works Progress Dashboard",
+    page_title="ಕಾಮಗಾರಿಗಳ ಪ್ರಗತಿ ವರದಿ",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -78,11 +78,9 @@ st.markdown(
 # ==============================================================================
 # 2. CONSTANTS & TARGET CONFIGURATION
 # ==============================================================================
-# Replace the placeholder below with your full Google Spreadsheet sharing URL
-# or set SPREADSHEET_URL in Streamlit Cloud Secrets.
 DEFAULT_SHEET_URL = st.secrets.get(
     "SPREADSHEET_URL",
-    "PASTE_YOUR_GOOGLE_SPREADSHEET_URL_HERE",
+    "https://docs.google.com/spreadsheets/d/1Mx-GVqqiznd_etK9pyygYd4uym0qfawCU_Rs-F5vbrk/edit?usp=sharing",
 )
 
 TARGET_SHEETS_RAW = [
@@ -119,7 +117,6 @@ VALID_DIVISIONS = [
     "ಹಳಿಯಾಳ",
 ]
 
-# Common spelling aliases mapped directly to the 8 canonical division names
 DIVISION_ALIASES = {
     "ಕಲಬುರ್ಗಿ": "ಕಲಬುರಗಿ",
     "ಕಲ್ಬುರ್ಗಿ": "ಕಲಬುರಗಿ",
@@ -136,19 +133,18 @@ DIVISION_ALIASES = {
     "ಬಳ್ಳಾರೀ": "ಬಳ್ಳಾರಿ",
 }
 
-# Range definitions (values in Lakhs: 1 Cr = 100 Lakhs)
 ESTIMATE_RANGES = {
-    "More than 100CR (> 10000 Lakhs)": lambda s: s > 10000,
-    "25CR - 100CR (> 2500 to <= 10000 Lakhs)": lambda s: (s > 2500) & (s <= 10000),
-    "10CR - 25CR (> 1000 to <= 2500 Lakhs)": lambda s: (s > 1000) & (s <= 2500),
-    "5CR - 10CR (> 500 to <= 1000 Lakhs)": lambda s: (s > 500) & (s <= 1000),
-    "2CR - 5CR (> 200 to <= 500 Lakhs)": lambda s: (s > 200) & (s <= 500),
-    "1CR - 5CR (> 100 to <= 500 Lakhs)": lambda s: (s > 100) & (s <= 500),
-    "0 - 2CR (>= 0 to <= 200 Lakhs)": lambda s: (s >= 0) & (s <= 200),
-    "Less than 1CR (< 100 Lakhs)": lambda s: s < 100,
+    "More than 100CR : > 10000": lambda s: s > 10000,
+    "25CR - 100CR : > 2500 to <= 10000": lambda s: (s > 2500) & (s <= 10000),
+    "10CR - 25CR : > 1000 to <= 2500": lambda s: (s > 1000) & (s <= 2500),
+    "5CR - 10CR : > 500 to <= 1000": lambda s: (s > 500) & (s <= 1000),
+    "2CR - 5CR : > 200 to <= 500": lambda s: (s > 200) & (s <= 500),
+    "1CR - 5CR : > 100 to <= 500": lambda s: (s > 100) & (s <= 500),
+    "0 - 2CR : >= 0 to <= 200": lambda s: (s >= 0) & (s <= 200),
+    "Less than 1CR : < 100": lambda s: s < 100,
 }
 
-# Canonical Column Names used across the app
+# Canonical Column Names
 COL_SF = "S/F"
 COL_PROGRESS = "PROGRESS STATUS (CP/CF)"
 COL_HEAD = "ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ"
@@ -164,7 +160,7 @@ COL_EXP_MAR26 = "ಮಾರ್ಚ್ 2026 ವರೆಗಿನ ವೆಚ್ಚ"
 COL_EXP_26_27 = "2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ"
 COL_TOTAL_EXP = "ಒಟ್ಟಾರೆ ವೆಚ್ಚ"
 COL_PENDING_BILL = "ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ"
-COL_BAL_REQ = "ಕಾಮಗಾರಿಯನ್ನು ಪೂರ್ಣಗೊಳಿಸಲು ಬೇಕಾಗುವ ಬಾಕಿ ಮೊತ್ತ"
+COL_BAL_REQ = "ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ"
 
 FINANCIAL_COLUMNS = [
     COL_EST_AMT,
@@ -178,10 +174,9 @@ FINANCIAL_COLUMNS = [
 ]
 
 # ==============================================================================
-# 3. HELPER FUNCTIONS FOR FUZZY MATCHING & COLUMN NORMALIZATION
+# 3. HELPER FUNCTIONS FOR FUZZY MATCHING & NORMALIZATION
 # ==============================================================================
 def clean_text(val) -> str:
-    """Removes zero-width characters, newlines, and extra spaces."""
     if pd.isna(val):
         return ""
     s = str(val)
@@ -190,8 +185,40 @@ def clean_text(val) -> str:
     return s
 
 
+def normalize_cp_cf(val) -> str:
+    """
+    Normalizes CP/CF column values:
+    - Converts 'p' and 'P' -> 'P'
+    - Converts 'C F', 'c f', 'C-F' -> 'CF'
+    - Converts 'C P', 'c p', 'C-P' -> 'CP'
+    """
+    s = clean_text(val)
+    if not s:
+        return "N/A"
+    s_upper = s.upper()
+    s_compact = re.sub(r"[\s\-_]+", "", s_upper)
+    if s_compact in {"P", "CF", "CP", "F", "S", "C", "NS", "WIP"} or re.match(
+        r"^[A-Z0-9/]+$", s_compact
+    ):
+        return s_compact
+    s_upper = re.sub(r"\bC\s*F\b", "CF", s_upper)
+    s_upper = re.sub(r"\bC\s*P\b", "CP", s_upper)
+    return s_upper
+
+
+def normalize_sf(val) -> str:
+    """Normalizes S/F column values (case-insensitive and space-trimmed)."""
+    s = clean_text(val)
+    if not s:
+        return "N/A"
+    s_upper = s.upper()
+    s_compact = re.sub(r"[\s\-_]+", "", s_upper)
+    if re.match(r"^[A-Z0-9/]+$", s_compact):
+        return s_compact
+    return s_upper
+
+
 def levenshtein_distance(s1: str, s2: str) -> int:
-    """Calculates character-level Levenshtein edit distance between two strings."""
     if len(s1) < len(s2):
         return levenshtein_distance(s2, s1)
     if len(s2) == 0:
@@ -209,29 +236,20 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 
 
 def match_division(raw_val) -> str | None:
-    """
-    Matches a raw cell value under 'ವಿಭಾಗದ ಹೆಸರು' to one of the 8 canonical
-    divisions, tolerating leading/trailing spaces and 1-2 character typos.
-    Returns None if the value does not belong to the 8 target divisions.
-    """
     cleaned = clean_text(raw_val)
     if not cleaned:
         return None
 
-    # Remove generic suffixes like 'ವಿಭಾಗ' or punctuation if present
     cleaned_core = re.sub(r"\bವಿಭಾಗ\b", "", cleaned).strip(" ,.-()/\\")
     if not cleaned_core:
         cleaned_core = cleaned
 
-    # 1. Direct match
     if cleaned_core in VALID_DIVISIONS:
         return cleaned_core
 
-    # 2. Known alias match
     if cleaned_core in DIVISION_ALIASES:
         return DIVISION_ALIASES[cleaned_core]
 
-    # 3. Substring containment (e.g., 'ಧಾರವಾಡ ವಿಭಾಗ' or 'ಕಲಬುರಗಿ (ನೀ)')
     for div in VALID_DIVISIONS:
         if div in cleaned_core:
             return div
@@ -239,7 +257,6 @@ def match_division(raw_val) -> str | None:
         if alias in cleaned_core:
             return canonical
 
-    # 4. Fuzzy / 1-letter typo tolerance (Levenshtein distance <= 2 or similarity >= 0.78)
     best_match = None
     best_dist = 999
     best_ratio = 0.0
@@ -264,7 +281,6 @@ def match_division(raw_val) -> str | None:
 
 
 def extract_sheet_id(url_or_id: str) -> str:
-    """Extracts the spreadsheet ID from a Google Sheets URL."""
     url_or_id = url_or_id.strip()
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url_or_id)
     if match:
@@ -273,7 +289,6 @@ def extract_sheet_id(url_or_id: str) -> str:
 
 
 def normalize_sheet_key(name: str) -> str:
-    """Normalizes sheet names for matching (strips quotes, ranges like !A1:AB, and spaces)."""
     s = re.sub(r"!.*$", "", str(name))
     s = s.strip("'\" ")
     s = re.sub(r"\s+", " ", s)
@@ -281,10 +296,6 @@ def normalize_sheet_key(name: str) -> str:
 
 
 def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
-    """
-    Identifies the required columns in a sheet even if headers contain extra spaces,
-    newlines, or extended text (like CP/CF inside a longer column header).
-    """
     col_mapping = {}
 
     for col in df.columns:
@@ -327,8 +338,14 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
             col_mapping.setdefault(COL_TENDER_AMT, col)
         elif "ಪರಿಷ್ಕೃತಅಂದಾಜುಮೊತ್ತ" in c_nospace:
             col_mapping.setdefault(COL_REV_EST_AMT, col)
-        elif ("ಮಾರ್ಚ್" in c_nospace and "2026" in c_nospace and "ವೆಚ್ಚ" in c_nospace) or (
-            "ಮಾರ್ಚ್2026ವರೆಗಿನವೆಚ್ಚ" in c_nospace
+        elif (
+            "ಮಾರ್ಚ-2026ವರೆಗಿನವೆಚ್ಚ" in c_nospace
+            or "ಮಾರ್ಚ್-2026ವರೆಗಿನವೆಚ್ಚ" in c_nospace
+            or (
+                ("ಮಾರ್ಚ" in c_nospace or "ಮಾರ್ಚ್" in c_nospace)
+                and "2026" in c_nospace
+                and "ವೆಚ್ಚ" in c_nospace
+            )
         ):
             col_mapping.setdefault(COL_EXP_MAR26, col)
         elif "2026-27" in c_nospace and "ವೆಚ್ಚ" in c_nospace:
@@ -337,12 +354,17 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
             col_mapping.setdefault(COL_TOTAL_EXP, col)
         elif "ಬಾಕಿಬಿಲ್ಲಿನಮೊತ್ತ" in c_nospace or "ಬಾಕಿಬಿಲ್" in c_nospace:
             col_mapping.setdefault(COL_PENDING_BILL, col)
-        elif "ಪೂರ್ಣಗೊಳಿಸಲುಬೇಕಾಗುವಬಾಕಿಮೊತ್ತ" in c_nospace or (
-            "ಪೂರ್ಣಗೊಳಿಸಲು" in c_nospace and "ಬಾಕಿ" in c_nospace
+        elif (
+            "ಪುರ್ಣಗೊಳಿಸಲುಬೇಕಾದಬಾಕಿಮೊತ್ತ" in c_nospace
+            or "ಪೂರ್ಣಗೊಳಿಸಲುಬೇಕಾಗುವಬಾಕಿಮೊತ್ತ" in c_nospace
+            or (
+                ("ಪುರ್ಣಗೊಳಿಸಲು" in c_nospace or "ಪೂರ್ಣಗೊಳಿಸಲು" in c_nospace)
+                and "ಬಾಕಿ" in c_nospace
+            )
+            or "(17-25)" in c_nospace
         ):
             col_mapping.setdefault(COL_BAL_REQ, col)
 
-    # Build a clean standardized dataframe
     std_df = pd.DataFrame(index=df.index)
     std_df["SHEET_NAME"] = sheet_name.strip()
 
@@ -360,7 +382,6 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
         if target_col in col_mapping:
             src_col = col_mapping[target_col]
             series_data = df[src_col]
-            # Handle duplicate column names in raw sheet if any
             if isinstance(series_data, pd.DataFrame):
                 series_data = series_data.iloc[:, 0]
             std_df[target_col] = series_data
@@ -371,28 +392,21 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
 
 def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
-    """
-    Finds the header row dynamically (scanning first 15 rows for 'ವಿಭಾಗದ ಹೆಸರು' or 'ಜಿಲ್ಲೆ'),
-    maps columns, filters rows by the 8 valid divisions (with fuzzy matching),
-    and converts financial columns to numeric values.
-    """
     if raw_df.empty:
         return pd.DataFrame()
 
     header_row_idx = None
     for idx in range(min(15, len(raw_df))):
-        row_Text = " ".join([clean_text(v).replace(" ", "") for v in raw_df.iloc[idx].values])
-        if "ವಿಭಾಗದಹೆಸರು" in row_Text or ("ಜಿಲ್ಲೆ" in row_Text and "ತಾಲ್ಲೂಕು" in row_Text):
+        row_text = " ".join([clean_text(v).replace(" ", "") for v in raw_df.iloc[idx].values])
+        if "ವಿಭಾಗದಹೆಸರು" in row_text or ("ಜಿಲ್ಲೆ" in row_text and "ತಾಲ್ಲೂಕು" in row_text):
             header_row_idx = idx
             break
 
     if header_row_idx is not None:
-        # Combine multi-row headers if the row directly below also has sub-headers (like CP/CF or amounts)
         headers = [clean_text(v) for v in raw_df.iloc[header_row_idx].values]
         if header_row_idx + 1 < len(raw_df):
             next_row = [clean_text(v) for v in raw_df.iloc[header_row_idx + 1].values]
             next_joined = " ".join(next_row)
-            # If the next row looks like a sub-header row (contains CP/CF or ವೆಚ್ಚ but no valid division data)
             if ("CP/CF" in next_joined.upper() or "ವೆಚ್ಚ" in next_joined) and not any(
                 match_division(x) for x in next_row
             ):
@@ -406,27 +420,29 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
                 header_row_idx += 1
 
         df = raw_df.iloc[header_row_idx + 1 :].copy()
-        df.columns = [
-            h if h else f"Unnamed_{i}" for i, h in enumerate(headers)
-        ]
+        df.columns = [h if h else f"Unnamed_{i}" for i, h in enumerate(headers)]
     else:
         df = raw_df.copy()
 
     std_df = detect_and_map_columns(df, sheet_name)
 
-    # Apply fuzzy matching on 'ವಿಭಾಗದ ಹೆಸರು' and filter to ONLY the 8 valid divisions
+    # Filter only the 8 valid divisions (with typo tolerance)
     std_df[COL_DIVISION] = std_df[COL_DIVISION].apply(match_division)
     std_df = std_df[std_df[COL_DIVISION].notna()].copy()
 
     if std_df.empty:
         return std_df
 
-    # Clean text filter columns
-    for text_col in [COL_SF, COL_PROGRESS, COL_HEAD, COL_DISTRICT, COL_TALUK, COL_CONSTITUENCY]:
+    # Normalize CP/CF ('p' -> 'P', 'C F' -> 'CF') and S/F
+    std_df[COL_PROGRESS] = std_df[COL_PROGRESS].apply(normalize_cp_cf)
+    std_df[COL_SF] = std_df[COL_SF].apply(normalize_sf)
+
+    # Clean other text filter columns
+    for text_col in [COL_HEAD, COL_DISTRICT, COL_TALUK, COL_CONSTITUENCY]:
         std_df[text_col] = std_df[text_col].apply(clean_text)
         std_df[text_col] = std_df[text_col].replace("", "N/A")
 
-    # Clean & convert numeric financial columns
+    # Convert financial columns to numeric
     for fin_col in FINANCIAL_COLUMNS:
         cleaned_num = (
             std_df[fin_col]
@@ -440,16 +456,13 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     return std_df
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def load_workbook_data(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[str]]:
-    """
-    Downloads the Google Spreadsheet as an Excel stream in a single request
-    and processes all 20 target sheets.
-    """
+# No TTL timer: Data stays cached until user manually clicks the Load button
+@st.cache_data(show_spinner=False)
+def fetch_and_process_workbook(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[str]]:
     sheet_id = extract_sheet_id(sheet_url)
     export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
 
-    response = requests.get(export_url, timeout=60)
+    response = requests.get(export_url, timeout=90)
     response.raise_for_status()
 
     excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
@@ -463,7 +476,6 @@ def load_workbook_data(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[st
         norm_key = normalize_sheet_key(target)
         actual_name = available_map.get(norm_key)
 
-        # Fallback: ignore underscores/spaces differences when matching sheet names
         if actual_name is None:
             compact_target = re.sub(r"[\s_]+", "", norm_key)
             for avail_norm, avail_orig in available_map.items():
@@ -489,61 +501,71 @@ def load_workbook_data(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[st
 
 
 # ==============================================================================
-# 4. MAIN APPLICATION UI
+# 4. MAIN APPLICATION UI (MANUAL LOAD ONLY)
 # ==============================================================================
 def main():
     st.markdown(
         """
         <div class="main-header">
-            <h1>📊 ಕಾಮಗಾರಿಗಳ ಪ್ರಗತಿ ವರದಿ (Works Progress Dashboard)</h1>
-            <p>Consolidated Multi-Sheet Analytics & Financial Progress Tracker (2026-27)</p>
+            <h1>📊 ಕಾಮಗಾರಿಗಳ ಪ್ರಗತಿ ವರದಿ</h1>
+            <p>2026-27ನೇ ಸಾಲಿನ ಕಾಮಗಾರಿಗಳ ಕ್ರೋಢೀಕೃತ ಆರ್ಥಿಕ ಮತ್ತು ಭೌತಿಕ ಪ್ರಗತಿ ವರದಿ</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    with st.sidebar:
-        st.header("⚙️ Data Source & Controls")
-        sheet_url_input = st.text_input(
-            "Google Spreadsheet URL",
-            value=DEFAULT_SHEET_URL,
-            help="Paste your Google Sheet link (shared as 'Anyone with the link can view').",
-        )
-        col_btn1, col_btn2 = st.columns(2)
-        with col_btn1:
-            if st.button("🔄 Refresh Data", use_container_width=True):
-                st.cache_data.clear()
-        with col_btn2:
-            unit_mode = st.selectbox(
-                "Display Unit",
-                options=["Lakhs (ಲಕ್ಷಗಳಲ್ಲಿ)", "Crores (ಕೋಟಿಗಳಲ್ಲಿ)"],
-                index=0,
-            )
+    if "data_loaded" not in st.session_state:
+        st.session_state.data_loaded = False
 
-    if not sheet_url_input or "PASTE_YOUR_GOOGLE_SPREADSHEET_URL_HERE" in sheet_url_input:
-        st.info(
-            "👈 Please enter your Google Spreadsheet URL in the sidebar (or set `DEFAULT_SHEET_URL` in `app.py`) to load the dashboard."
+    with st.sidebar:
+        st.header("⚙️ ಡೇಟಾ ನಿಯಂತ್ರಣ")
+        sheet_url_input = st.text_input(
+            "Google Spreadsheet ಲಿಂಕ್",
+            value=DEFAULT_SHEET_URL,
         )
+
+        # Manual Load / Refresh Button
+        manual_load_clicked = st.button(
+            "🔄 ಡೇಟಾ ಲೋಡ್ / ರಿಫ್ರೆಶ್ ಮಾಡಿ (15-20s)",
+            type="primary",
+            use_container_width=True,
+        )
+
+        unit_mode = st.selectbox(
+            "ಮೊತ್ತದ ಘಟಕ",
+            options=["ಲಕ್ಷಗಳಲ್ಲಿ (Lakhs)", "ಕೋಟಿಗಳಲ್ಲಿ (Crores)"],
+            index=0,
+        )
+
+    if manual_load_clicked:
+        st.cache_data.clear()
+        st.session_state.data_loaded = True
+
+    if not st.session_state.data_loaded:
+        st.info(
+            "👆 ಡ್ಯಾಶ್‌ಬೋರ್ಡ್ ವೀಕ್ಷಿಸಲು ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಅಥವಾ ಎಡಭಾಗದ **'🔄 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ (15-20s)'** ಬಟನ್ ಒತ್ತಿ."
+        )
+        if st.button("📥 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ (15-20 ಸೆಕೆಂಡುಗಳು)", type="primary"):
+            st.session_state.data_loaded = True
+            st.rerun()
         st.stop()
 
-    with st.spinner("Loading and consolidating 20 sheets from Google Drive..."):
+    with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ 20 ಶೀಟ್‌ಗಳ ಡೇಟಾವನ್ನು ಲೋಡ್ ಮಾಡಲಾಗುತ್ತಿದೆ (15-20 ಸೆಕೆಂಡುಗಳು)..."):
         try:
-            df, loaded_sheets, missing_sheets = load_workbook_data(sheet_url_input)
+            df, loaded_sheets, missing_sheets = fetch_and_process_workbook(sheet_url_input)
         except Exception as e:
-            st.error(
-                f"Unable to fetch spreadsheet. Ensure the sheet is shared with 'Anyone with the link' or upload the file. Details: {e}"
-            )
+            st.error(f"ಡೇಟಾ ಲೋಡ್ ಮಾಡುವಲ್ಲಿ ದೋಷ ಕಂಡುಬಂದಿದೆ: {e}")
             st.stop()
 
     if df.empty:
-        st.warning("No matching rows found for the 8 specified divisions across the target sheets.")
+        st.warning("ನಿಗದಿಪಡಿಸಿದ 8 ವಿಭಾಗಗಳಿಗೆ ಸಂಬಂಧಿಸಿದ ಯಾವುದೇ ಕಾಮಗಾರಿಗಳ ಮಾಹಿತಿ ಕಂಡುಬಂದಿಲ್ಲ.")
         st.stop()
 
     # ==========================================================================
-    # 5. SIDEBAR FILTERS (CASCADING & MULTI-SELECT)
+    # 5. SIDEBAR FILTERS
     # ==========================================================================
     st.sidebar.markdown("---")
-    st.sidebar.header("🔍 ಫಿಲ್ಟರ್‌ಗಳು (Filters)")
+    st.sidebar.header("🔍 ಫಿಲ್ಟರ್‌ಗಳು")
 
     filtered_df = df.copy()
 
@@ -566,10 +588,10 @@ def main():
 
     # 3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER
     filtered_df = apply_multiselect_filter(
-        filtered_df, COL_HEAD, "3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER (ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ)"
+        filtered_df, COL_HEAD, "3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER"
     )
 
-    # 4. ವಿಭಾಗ FILTER (Ordered by the 8 canonical divisions)
+    # 4. ವಿಭಾಗ FILTER
     avail_divisions = [d for d in VALID_DIVISIONS if d in filtered_df[COL_DIVISION].unique()]
     sel_divisions = st.sidebar.multiselect(
         "4. ವಿಭಾಗ FILTER (ವಿಭಾಗದ ಹೆಸರು)", options=avail_divisions, default=[]
@@ -586,12 +608,11 @@ def main():
     # 7. ಮತಕ್ಷೇತ್ರ FILTER
     filtered_df = apply_multiselect_filter(filtered_df, COL_CONSTITUENCY, "7. ಮತಕ್ಷೇತ್ರ FILTER")
 
-    # 8. ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ (RANGE) FILTER (Supports multiple overlapping selections)
+    # 8. ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ (RANGE) FILTER
     sel_ranges = st.sidebar.multiselect(
         "8. ಮೂಲ ಅಂದಾಜು ಮೊತ್ತ (RANGE) FILTER",
         options=list(ESTIMATE_RANGES.keys()),
         default=[],
-        help="Values in sheet are in Lakhs (100 Lakhs = 1 Crore). You can select multiple ranges.",
     )
     if sel_ranges:
         range_mask = pd.Series(False, index=filtered_df.index)
@@ -602,17 +623,17 @@ def main():
     # ==========================================================================
     # 6. KPI METRIC CARDS (9 REQUIRED VALUES)
     # ==========================================================================
-    is_crores = unit_mode.startswith("Crores")
+    is_crores = "ಕೋಟಿ" in unit_mode
     divisor = 100.0 if is_crores else 1.0
-    unit_suffix = "Cr (ಕೋಟಿ)" if is_crores else "Lakhs (ಲಕ್ಷ)"
+    unit_suffix = "ಕೋಟಿ (Cr)" if is_crores else "ಲಕ್ಷ (Lakhs)"
 
     total_works = len(filtered_df)
     sums = {col: filtered_df[col].sum() / divisor for col in FINANCIAL_COLUMNS}
 
-    st.subheader(f"📌 ಪ್ರಮುಖ ಅಂಕಿಅಂಶಗಳು (Summary Metrics — in {unit_suffix})")
+    st.subheader(f"📌 ಪ್ರಮುಖ ಅಂಕಿಅಂಶಗಳು ({unit_suffix}ಗಳಲ್ಲಿ)")
 
     kpi_items = [
-        ("ಒಟ್ಟು ಕಾಮಗಾರಿಗಳ ಸಂಖ್ಯೆ", f"{total_works:,}", "Total Number of Works", True),
+        ("ಒಟ್ಟು ಕಾಮಗಾರಿಗಳ ಸಂಖ್ಯೆ", f"{total_works:,}", "ಒಟ್ಟು ಕಾಮಗಾರಿಗಳು", True),
         (
             "ಒಟ್ಟು ಅಂದಾಜು ಮೊತ್ತ",
             f"₹ {sums[COL_EST_AMT]:,.2f}",
@@ -622,7 +643,7 @@ def main():
         (
             "ಗುತ್ತಿಗೆ ಮೊತ್ತ (ಜಿ.ಎಸ್.ಟಿ ಸೇರಿದಂತೆ)",
             f"₹ {sums[COL_TENDER_AMT]:,.2f}",
-            f"Tender Amount incl. GST ({unit_suffix})",
+            f"ಗುತ್ತಿಗೆ ಮೊತ್ತ ({unit_suffix})",
             False,
         ),
         (
@@ -634,31 +655,31 @@ def main():
         (
             "ಮಾರ್ಚ್ 2026 ವರೆಗಿನ ವೆಚ್ಚ",
             f"₹ {sums[COL_EXP_MAR26]:,.2f}",
-            f"Expenditure up to March 2026 ({unit_suffix})",
+            f"ಮಾರ್ಚ-2026 ವರೆಗಿನ ವೆಚ್ಚ ({unit_suffix})",
             False,
         ),
         (
             "2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ",
             f"₹ {sums[COL_EXP_26_27]:,.2f}",
-            f"2026-27 Expenditure ({unit_suffix})",
+            f"2026-27ನೇ ಸಾಲಿನ ವೆಚ್ಚ ({unit_suffix})",
             False,
         ),
         (
             "ಒಟ್ಟಾರೆ ವೆಚ್ಚ",
             f"₹ {sums[COL_TOTAL_EXP]:,.2f}",
-            f"Total Expenditure ({unit_suffix})",
+            f"ಒಟ್ಟಾರೆ ವೆಚ್ಚ ({unit_suffix})",
             False,
         ),
         (
             "ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ",
             f"₹ {sums[COL_PENDING_BILL]:,.2f}",
-            f"Pending Bill Amount ({unit_suffix})",
+            f"ಬಾಕಿ ಬಿಲ್ಲಿನ ಮೊತ್ತ ({unit_suffix})",
             False,
         ),
         (
-            "ಕಾಮಗಾರಿಯನ್ನು ಪೂರ್ಣಗೊಳಿಸಲು ಬೇಕಾಗುವ ಬಾಕಿ ಮೊತ್ತ",
+            "ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ",
             f"₹ {sums[COL_BAL_REQ]:,.2f}",
-            f"Balance Required to Complete ({unit_suffix})",
+            f"ಕಾಮಗಾರಿಯನ್ನು ಪುರ್ಣಗೊಳಿಸಲು ಬೇಕಾದ ಬಾಕಿ ಮೊತ್ತ (17-25) ({unit_suffix})",
             False,
         ),
     ]
@@ -683,19 +704,19 @@ def main():
     st.markdown("---")
 
     # ==========================================================================
-    # 7. TABS: DIVISION ABSTRACT, VISUAL CHARTS & DETAILED DATA
+    # 7. TABS: DIVISION ABSTRACT, CHARTS & DETAILED DATA
     # ==========================================================================
     tab1, tab2, tab3, tab4 = st.tabs(
         [
-            "📋 ವಿಭಾಗವಾರು ಸಾರಾಂಶ (Division Abstract)",
-            "📈 ನಕ್ಷೆಗಳು (Visual Analytics)",
-            "📄 ಸಂಪೂರ್ಣ ಕಾಮಗಾರಿಗಳ ವಿವರ (Detailed Works)",
-            "🗂️ ಮೂಲ ಶೀಟ್ ಸ್ಥಿತಿ (Sheet Status)",
+            "📋 ವಿಭಾಗವಾರು ಸಾರಾಂಶ",
+            "📈 ನಕ್ಷೆಗಳು",
+            "📄 ಸಂಪೂರ್ಣ ಕಾಮಗಾರಿಗಳ ವಿವರ",
+            "🗂️ ಮೂಲ ಶೀಟ್ ಸ್ಥಿತಿ",
         ]
     )
 
     with tab1:
-        st.markdown(f"#### ವಿಭಾಗವಾರು ಗೋಷ್ಟ್ವಾರೆ (Values in {unit_suffix})")
+        st.markdown(f"#### ವಿಭಾಗವಾರು ಗೋಷ್ಟ್ವಾರೆ ({unit_suffix}ಗಳಲ್ಲಿ)")
         div_group = (
             filtered_df.groupby(COL_DIVISION, as_index=False)
             .agg(
@@ -710,7 +731,6 @@ def main():
             )
         )
 
-        # Add Grand Total row
         if not div_group.empty:
             total_row = {"ವಿಭಾಗದ ಹೆಸರು": "ಒಟ್ಟು (Grand Total)"}
             for c in div_group.columns[1:]:
@@ -752,7 +772,7 @@ def main():
         st.markdown(f"#### ಫಿಲ್ಟರ್ ಮಾಡಲಾದ ಕಾಮಗಾರಿಗಳ ಪಟ್ಟಿ ({len(filtered_df):,} ಕಾಮಗಾರಿಗಳು)")
         csv_bytes = filtered_df.to_csv(index=False).encode("utf-8-sig")
         st.download_button(
-            label="📥 Download Filtered Data (CSV)",
+            label="📥 ಫಿಲ್ಟರ್ ಮಾಡಿದ ಡೇಟಾ ಡೌನ್‌ಲೋಡ್ ಮಾಡಿ (CSV)",
             data=csv_bytes,
             file_name="filtered_progress_report_2026_27.csv",
             mime="text/csv",
@@ -760,15 +780,15 @@ def main():
         st.dataframe(filtered_df, use_container_width=True, height=500)
 
     with tab4:
-        st.markdown("#### ಪರಿಗಣಿಸಲಾದ ಶೀಟ್‌ಗಳ ಸ್ಥಿತಿ (20 Target Sheets)")
+        st.markdown("#### ಪರಿಗಣಿಸಲಾದ 20 ಶೀಟ್‌ಗಳ ಸ್ಥಿತಿ")
         sheet_counts = (
             df.groupby("SHEET_NAME")
             .size()
-            .reset_index(name="Valid Rows (8 Target Divisions)")
+            .reset_index(name="ಪರಿಗಣಿಸಲಾದ ಕಾಮಗಾರಿಗಳ ಸಂಖ್ಯೆ (8 ವಿಭಾಗಗಳು)")
         )
         st.dataframe(sheet_counts, use_container_width=True, hide_index=True)
         if missing_sheets:
-            st.warning(f"Sheets not found in workbook: {', '.join(missing_sheets)}")
+            st.warning(f"ಕಂಡುಬರದ ಶೀಟ್‌ಗಳು: {', '.join(missing_sheets)}")
 
 
 if __name__ == "__main__":
