@@ -1,6 +1,10 @@
 import io
+import os
 import re
+import pickle
 import difflib
+import unicodedata
+from datetime import datetime, timezone, timedelta
 import requests
 import numpy as np
 import pandas as pd
@@ -78,6 +82,8 @@ st.markdown(
 # ==============================================================================
 # 2. CONSTANTS & TARGET CONFIGURATION
 # ==============================================================================
+SNAPSHOT_FILE = "snapshot_data.pkl"
+
 DEFAULT_SHEET_URL = st.secrets.get(
     "SPREADSHEET_URL",
     "https://docs.google.com/spreadsheets/d/1Mx-GVqqiznd_etK9pyygYd4uym0qfawCU_Rs-F5vbrk/edit?usp=sharing",
@@ -173,18 +179,20 @@ FINANCIAL_COLUMNS = [
 ]
 
 # ==============================================================================
-# 3. HELPER FUNCTIONS
+# 3. TEXT CLEANING, KANNADA PHONETIC KEY & FUZZY UNIFICATION
 # ==============================================================================
 def clean_text(val) -> str:
+    """Normalizes Unicode (NFC) to fix decomposed Kannada vowels and strips extra spaces."""
     if pd.isna(val):
         return ""
-    s = str(val)
+    s = unicodedata.normalize("NFC", str(val))
     s = re.sub(r"[\u200b\u200c\u200d\ufeff\r\n\t]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def normalize_cp_cf(val) -> str:
+    """Unifies 'p'/'P' -> 'P', 'C F' -> 'CF', 'C P' -> 'CP'."""
     s = clean_text(val)
     if not s:
         return "N/A"
@@ -225,6 +233,103 @@ def levenshtein_distance(s1: str, s2: str) -> int:
             current_row.append(min(insertions, deletions, substitutions))
         previous_row = current_row
     return previous_row[-1]
+
+
+def kannada_phonetic_key(s: str) -> str:
+    """
+    Creates a normalized skeleton for Kannada place names so minor spelling variations
+    (like ಕಮಲಾಪುರ vs ಕಮಲಾಪೂರ, ಸಿಂದಗಿ vs ಸಿಂಧಗಿ, ಬೀದರ vs ಬೀದರ್) produce the exact same key.
+    """
+    s = clean_text(s)
+    s = re.sub(r"[\s\-_.,()]+", "", s)
+    # Remove trailing halant (್) or convert trailing ಮ್ -> ಂ
+    s = re.sub(r"ಮ್$", "ಂ", s)
+    s = re.sub(r"್$", "", s)
+    # Normalize trailing ೂರು / ೂರ -> ುರ
+    s = re.sub(r"ೂರು$", "ುರ", s)
+    s = re.sub(r"ೂರ$", "ುರ", s)
+    # Normalize long vowel signs to short vowel signs
+    vowel_map = str.maketrans({
+        "ೀ": "ಿ",
+        "ೂ": "ು",
+        "ೇ": "ೆ",
+        "ೋ": "ೊ",
+        "ಆ": "ಅ",
+        "ಈ": "ಇ",
+        "ಊ": "ಉ",
+        "ಏ": "ಎ",
+        "ಓ": "ಒ",
+        # Aspirated to unaspirated consonants
+        "ಖ": "ಕ",
+        "ಘ": "ಗ",
+        "ಛ": "ಚ",
+        "ಝ": "ಜ",
+        "ಠ": "ಟ",
+        "ಢ": "ಡ",
+        "ಥ": "ತ",
+        "ಧ": "ದ",
+        "ಫ": "ಪ",
+        "ಭ": "ಬ",
+        "ಷ": "ಶ",
+    })
+    s = s.translate(vowel_map)
+    # Strip trailing 'ಾ' (e.g., ಯಲಬುರ್ಗಾ vs ಯಲಬುರ್ಗ)
+    s = re.sub(r"ಾ$", "", s)
+    return s
+
+
+def unify_similar_names(series: pd.Series, preserve_slash: bool = True) -> pd.Series:
+    """
+    Groups similar place names (like ಕಮಲಾಪುರ and ಕಮಲಾಪೂರ) under the most frequent
+    spelling in the dataset. Leaves combined entries with '/' (like ಕೊಲ್ಹಾರ/ ಬಸವನ ಬಾಗೇವಾಡಿ)
+    untouched when preserve_slash=True.
+    """
+    val_counts = series.value_counts()
+    canonical_map = {}
+    phonetic_to_canonical = {}
+    canonical_list = []
+
+    for val, _ in val_counts.items():
+        if not val or val == "N/A":
+            canonical_map[val] = "N/A"
+            continue
+
+        # Leave entries with '/' (two taluks) untouched as requested
+        if preserve_slash and "/" in val:
+            canonical_map[val] = val
+            continue
+
+        pkey = kannada_phonetic_key(val)
+        if not pkey:
+            canonical_map[val] = val
+            continue
+
+        # 1. Exact phonetic/vowel-length match (catches ಕಮಲಾಪುರ vs ಕಮಲಾಪೂರ)
+        if pkey in phonetic_to_canonical:
+            canonical_map[val] = phonetic_to_canonical[pkey]
+            continue
+
+        # 2. Check 1-character typo against existing canonical names (same starting letter)
+        val_nospace = re.sub(r"\s+", "", val)
+        matched_canon = None
+        for canon in canonical_list:
+            canon_nospace = re.sub(r"\s+", "", canon)
+            if len(val_nospace) >= 4 and len(canon_nospace) >= 4:
+                if val_nospace[0] == canon_nospace[0]:
+                    dist = levenshtein_distance(val_nospace, canon_nospace)
+                    if dist <= 1:
+                        matched_canon = canon
+                        break
+
+        if matched_canon:
+            canonical_map[val] = matched_canon
+            phonetic_to_canonical[pkey] = matched_canon
+        else:
+            canonical_map[val] = val
+            phonetic_to_canonical[pkey] = val
+            canonical_list.append(val)
+
+    return series.map(lambda x: canonical_map.get(x, x))
 
 
 def match_division(raw_val) -> str | None:
@@ -288,20 +393,44 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
         c_nospace = c_clean.replace(" ", "")
         c_upper = c_clean.upper()
 
+        # 1. S/F Filter
         if re.search(r"\bS\s*/\s*F\b", c_upper) or c_upper == "S/F":
             col_mapping.setdefault(COL_SF, col)
+
+        # 2. Progress Status (CP/CF)
         elif "CP/CF" in c_upper or re.search(r"CP\s*/\s*CF", c_upper):
             col_mapping.setdefault(COL_PROGRESS, col)
-        elif "ಲೆಕ್ಕಶೀರ್ಷಿಕೆ" in c_nospace or "ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ" in c_clean:
+
+        # 3. ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ
+        elif "ಲೆಕ್ಕಶೀರ್ಷಿಕೆ" in c_nospace or "ಲೆಕ್ಕಶಿರ್ಷಿಕೆ" in c_nospace or "ಲೆಕ್ಕ" in c_nospace:
             col_mapping.setdefault(COL_HEAD, col)
+
+        # 4. ವಿಭಾಗದ ಹೆಸರು
         elif "ವಿಭಾಗದಹೆಸರು" in c_nospace or c_clean == "ವಿಭಾಗ":
             col_mapping.setdefault(COL_DIVISION, col)
-        elif c_nospace == "ಜಿಲ್ಲೆ" or "ಜಿಲ್ಲೆಯಹೆಸರು" in c_nospace:
+
+        # 5. ಜಿಲ್ಲೆ
+        elif c_nospace == "ಜಿಲ್ಲೆ" or "ಜಿಲ್ಲೆಯಹೆಸರು" in c_nospace or c_nospace.startswith("ಜಿಲ್ಲೆ"):
             col_mapping.setdefault(COL_DISTRICT, col)
-        elif c_nospace in ["ತಾಲ್ಲೂಕು", "ತಾಲೂಕು"]:
+
+        # 6. ತಾಲ್ಲೂಕು
+        elif any(t in c_nospace for t in ["ತಾಲ್ಲೂಕು", "ತಾಲೂಕು", "ತಾಲ್ಲುಕು", "ತಾಲೂಕ"]):
             col_mapping.setdefault(COL_TALUK, col)
-        elif "ಮತಕ್ಷೇತ್ರ" in c_nospace:
+
+        # 7. ಮತಕ್ಷೇತ್ರ (Catches ಮತಕ್ಷೇತ್ರ, ಮತಕ್ಷೆತ್ರ, ಮತ ಕ್ಷೇತ್ರ, ವಿಧಾನಸಭಾ ಕ್ಷೇತ್ರ, ಕ್ಷೇತ್ರ)
+        elif (
+            "ಮತಕ್ಷ" in c_nospace
+            or "ವಿಧಾನಸಭ" in c_nospace
+            or "ಮತಕ್ಷೇತ್ರ" in c_nospace
+            or "ಮತಕ್ಷೆತ್ರ" in c_nospace
+            or (
+                ("ಕ್ಷೇತ್ರ" in c_nospace or "ಕ್ಷೆತ್ರ" in c_nospace)
+                and not any(x in c_nospace for x in ["ಅಚ್ಚುಕಟ್ಟು", "ಹೆಕ್ಟೇರ್", "ಎಕರೆ", "ರೈತರ"])
+            )
+        ):
             col_mapping.setdefault(COL_CONSTITUENCY, col)
+
+        # 8. Financial Columns
         elif "ಮೂಲಅಂದಾಜುಮೊತ್ತ" in c_nospace:
             col_mapping.setdefault(COL_EST_AMT, col)
         elif "ಗುತ್ತಿಗೆಮೊತ್ತ" in c_nospace:
@@ -374,22 +503,33 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
     if header_row_idx is not None:
         headers = [clean_text(v) for v in raw_df.iloc[header_row_idx].values]
+
+        # If header cells are merged vertically with the row above, inherit non-empty labels
+        if header_row_idx > 0:
+            prev_row = [clean_text(v) for v in raw_df.iloc[header_row_idx - 1].values]
+            non_empty_prev = sum(1 for x in prev_row if x)
+            if non_empty_prev >= 3:
+                headers = [
+                    h if h else p for h, p in zip(headers, prev_row)
+                ]
+
+        # Combine sub-headers in the row immediately below if it is not a data row
+        data_start_idx = header_row_idx + 1
         if header_row_idx + 1 < len(raw_df):
             next_row = [clean_text(v) for v in raw_df.iloc[header_row_idx + 1].values]
-            next_joined = " ".join(next_row)
-            if ("CP/CF" in next_joined.upper() or "ವೆಚ್ಚ" in next_joined) and not any(
-                match_division(x) for x in next_row
-            ):
-                combined_headers = []
-                for h1, h2 in zip(headers, next_row):
-                    if h2 and h2 != h1 and not h2.isdigit():
-                        combined_headers.append(f"{h1} {h2}".strip())
-                    else:
-                        combined_headers.append(h1)
-                headers = combined_headers
-                header_row_idx += 1
+            if not any(match_division(x) for x in next_row):
+                next_joined = " ".join(next_row)
+                if "CP/CF" in next_joined.upper() or "ವೆಚ್ಚ" in next_joined or "ಮತಕ್ಷ" in next_joined:
+                    combined_headers = []
+                    for h1, h2 in zip(headers, next_row):
+                        if h2 and h2 != h1 and not h2.isdigit():
+                            combined_headers.append(f"{h1} {h2}".strip())
+                        else:
+                            combined_headers.append(h1)
+                    headers = combined_headers
+                    data_start_idx = header_row_idx + 2
 
-        df = raw_df.iloc[header_row_idx + 1 :].copy()
+        df = raw_df.iloc[data_start_idx:].copy()
         df.columns = [h if h else f"Unnamed_{i}" for i, h in enumerate(headers)]
     else:
         df = raw_df.copy()
@@ -423,16 +563,14 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 4. ROBUST SINGLE-REQUEST WORKBOOK LOADER (NO TIMEOUTS)
+# 4. PERSISTENT SNAPSHOT ENGINE (LOADS INSTANTLY ON APP OPEN)
 # ==============================================================================
-@st.cache_data(show_spinner=False)
-def fetch_and_process_workbook(sheet_url: str) -> tuple[pd.DataFrame, list[str], list[str]]:
+def download_and_build_snapshot(sheet_url: str) -> dict:
+    """Downloads fresh data from Google Sheets, unifies typos, and saves to disk snapshot."""
     sheet_id = extract_sheet_id(sheet_url)
-    
-    # Download the workbook directly as xlsx once with a generous timeout
     export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-    
-    response = requests.get(export_url, timeout=45)
+
+    response = requests.get(export_url, timeout=60)
     response.raise_for_status()
 
     excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
@@ -464,10 +602,52 @@ def fetch_and_process_workbook(sheet_url: str) -> tuple[pd.DataFrame, list[str],
 
     if loaded_frames:
         combined_df = pd.concat(loaded_frames, ignore_index=True)
+        # Unify similar spellings in Taluk (preserving '/' entries), District, and Constituency
+        combined_df[COL_TALUK] = unify_similar_names(combined_df[COL_TALUK], preserve_slash=True)
+        combined_df[COL_DISTRICT] = unify_similar_names(combined_df[COL_DISTRICT], preserve_slash=True)
+        combined_df[COL_CONSTITUENCY] = unify_similar_names(
+            combined_df[COL_CONSTITUENCY], preserve_slash=True
+        )
     else:
         combined_df = pd.DataFrame()
 
-    return combined_df, sorted(loaded_sheets), missing_sheets
+    ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime(
+        "%d-%m-%Y %I:%M %p IST"
+    )
+
+    snapshot_payload = {
+        "df": combined_df,
+        "loaded_sheets": sorted(loaded_sheets),
+        "missing_sheets": missing_sheets,
+        "timestamp": ist_now,
+    }
+
+    # Save snapshot to local disk so future visits load instantaneously
+    try:
+        with open(SNAPSHOT_FILE, "wb") as f:
+            pickle.dump(snapshot_payload, f)
+    except Exception:
+        pass
+
+    return snapshot_payload
+
+
+@st.cache_data(show_spinner=False)
+def get_active_snapshot(sheet_url: str) -> dict:
+    """
+    Loads the saved snapshot from disk instantaneously if available.
+    Only downloads from Google Sheets if no snapshot file exists yet.
+    """
+    if os.path.exists(SNAPSHOT_FILE):
+        try:
+            with open(SNAPSHOT_FILE, "rb") as f:
+                data = pickle.load(f)
+            if isinstance(data, dict) and "df" in data and not data["df"].empty:
+                return data
+        except Exception:
+            pass
+
+    return download_and_build_snapshot(sheet_url)
 
 
 # ==============================================================================
@@ -484,20 +664,18 @@ def main():
         unsafe_allow_html=True,
     )
 
-    if "data_loaded" not in st.session_state:
-        st.session_state.data_loaded = False
-
     with st.sidebar:
-        st.header("⚙️ ಡೇಟಾ ನಿಯಂತ್ರಣ")
+        st.header("⚙️ ಡೇಟಾ ನಿಯಂತ್ರಣ (Snapshot)")
         sheet_url_input = st.text_input(
             "Google Spreadsheet ಲಿಂಕ್",
             value=DEFAULT_SHEET_URL,
         )
 
-        manual_load_clicked = st.button(
-            "🔄 ಡೇಟಾ ಲೋಡ್ / ರಿಫ್ರೆಶ್ಟ್ ಮಾಡಿ",
+        refresh_clicked = st.button(
+            "🔄 ಹೊಸ ಡೇಟಾ ರಿಫ್ರೆಶ್ ಮಾಡಿ (Update Snapshot)",
             type="primary",
             use_container_width=True,
+            help="ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ ತಾಜಾ ಡೇಟಾ ತಂದು ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸೇವ್ ಮಾಡಲು ಮಾತ್ರ ಇದನ್ನು ಒತ್ತಿ.",
         )
 
         unit_mode = st.selectbox(
@@ -506,25 +684,42 @@ def main():
             index=0,
         )
 
-    if manual_load_clicked:
-        st.cache_data.clear()
-        st.session_state.data_loaded = True
+    # If user clicks Refresh, rebuild snapshot from Google Sheets and overwrite disk cache
+    if refresh_clicked:
+        with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ ಹೊಸ ಡೇಟಾ ಸಿಂಕ್ ಮಾಡಲಾಗುತ್ತಿದೆ..."):
+            try:
+                snapshot = download_and_build_snapshot(sheet_url_input)
+                st.cache_data.clear()
+                st.sidebar.success("✅ ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಯಶಸ್ವಿಯಾಗಿ ಸೇವ್ ಆಗಿದೆ!")
+            except Exception as e:
+                st.sidebar.error(f"ರಿಫ್ರೆಶ್ ದೋಷ: {e}")
+                st.stop()
+    else:
+        with st.spinner("ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಡೇಟಾ ಲೋಡ್ ಆಗುತ್ತಿದೆ..."):
+            try:
+                snapshot = get_active_snapshot(sheet_url_input)
+            except Exception as e:
+                st.error(f"ಡೇಟಾ ಲೋಡ್ ಮಾಡುವಲ್ಲಿ ದೋಷ ಕಂಡುಬಂದಿದೆ: {e}")
+                st.stop()
 
-    if not st.session_state.data_loaded:
-        st.info(
-            "👆 ಡ್ಯಾಶ್‌ಬೋರ್ಡ್ ವೀಕ್ಷಿಸಲು ದಯವಿಟ್ಟು ಕೆಳಗಿನ ಅಥವಾ ಎಡಭಾಗದ **'🔄 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ'** ಬಟನ್ ಒತ್ತಿ."
-        )
-        if st.button("📥 ಡೇಟಾ ಲೋಡ್ ಮಾಡಿ", type="primary"):
-            st.session_state.data_loaded = True
-            st.rerun()
-        st.stop()
+    df = snapshot["df"]
+    loaded_sheets = snapshot["loaded_sheets"]
+    missing_sheets = snapshot["missing_sheets"]
+    snap_time = snapshot.get("timestamp", "ಲಭ್ಯವಿಲ್ಲ")
 
-    with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ ಡೇಟಾ ಲೋಡ್ ಮಾಡಲಾಗುತ್ತಿದೆ..."):
-        try:
-            df, loaded_sheets, missing_sheets = fetch_and_process_workbook(sheet_url_input)
-        except Exception as e:
-            st.error(f"ಡೇಟಾ ಲೋಡ್ ಮಾಡುವಲ್ಲಿ ದೋಷ ಕಂಡುಬಂದಿದೆ: {e}")
-            st.stop()
+    st.sidebar.caption(f"📸 **ಕೊನೆಯ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸಮಯ:** {snap_time}")
+
+    # Optional: allow downloading snapshot_data.pkl to commit to GitHub for 100% permanent storage
+    if os.path.exists(SNAPSHOT_FILE):
+        with open(SNAPSHOT_FILE, "rb") as f:
+            st.sidebar.download_button(
+                label="💾 ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಬ್ಯಾಕಪ್ ಡೌನ್‌ಲೋಡ್ (.pkl)",
+                data=f.read(),
+                file_name="snapshot_data.pkl",
+                mime="application/octet-stream",
+                use_container_width=True,
+                help="ಈ ಫೈಲ್ ಅನ್ನು GitHub ರೆಪೊಸಿಟರಿಯಲ್ಲಿ ಸೇರಿಸಿದರೆ ಸರ್ವರ್ ರೀಸ್ಟಾರ್ಟ್ ಆದರೂ ಡೇಟಾ ಶಾಶ್ವತವಾಗಿ ಇರುತ್ತದೆ.",
+            )
 
     if df.empty:
         st.warning("ನಿಗದಿಪಡಿಸಿದ 8 ವಿಭಾಗಗಳಿಗೆ ಸಂಬಂಧಿಸಿದ ಯಾವುದೇ ಕಾಮಗಾರಿಗಳ ಮಾಹಿತಿ ಕಂಡುಬಂದಿಲ್ಲ.")
@@ -548,7 +743,9 @@ def main():
         return data
 
     filtered_df = apply_multiselect_filter(filtered_df, COL_SF, "1. S / F FILTER")
-    filtered_df = apply_multiselect_filter(filtered_df, COL_PROGRESS, "2. PROGRESS STATUS FILTER (CP/CF)")
+    filtered_df = apply_multiselect_filter(
+        filtered_df, COL_PROGRESS, "2. PROGRESS STATUS FILTER (CP/CF)"
+    )
     filtered_df = apply_multiselect_filter(filtered_df, COL_HEAD, "3. ಲೆಕ್ಕಶೀರ್ಷಿಕೆ FILTER")
 
     avail_divisions = [d for d in VALID_DIVISIONS if d in filtered_df[COL_DIVISION].unique()]
