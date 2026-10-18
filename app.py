@@ -1,9 +1,11 @@
 import io
 import os
 import re
+import time
 import pickle
 import difflib
 import unicodedata
+from urllib.parse import quote
 from datetime import datetime, timezone, timedelta
 import requests
 import numpy as np
@@ -182,7 +184,6 @@ FINANCIAL_COLUMNS = [
 # 3. TEXT CLEANING, KANNADA PHONETIC KEY & FUZZY UNIFICATION
 # ==============================================================================
 def clean_text(val) -> str:
-    """Normalizes Unicode (NFC) to fix decomposed Kannada vowels and strips extra spaces."""
     if pd.isna(val):
         return ""
     s = unicodedata.normalize("NFC", str(val))
@@ -192,7 +193,6 @@ def clean_text(val) -> str:
 
 
 def normalize_cp_cf(val) -> str:
-    """Unifies 'p'/'P' -> 'P', 'C F' -> 'CF', 'C P' -> 'CP'."""
     s = clean_text(val)
     if not s:
         return "N/A"
@@ -236,19 +236,12 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 
 
 def kannada_phonetic_key(s: str) -> str:
-    """
-    Creates a normalized skeleton for Kannada place names so minor spelling variations
-    (like ಕಮಲಾಪುರ vs ಕಮಲಾಪೂರ, ಸಿಂದಗಿ vs ಸಿಂಧಗಿ, ಬೀದರ vs ಬೀದರ್) produce the exact same key.
-    """
     s = clean_text(s)
     s = re.sub(r"[\s\-_.,()]+", "", s)
-    # Remove trailing halant (್) or convert trailing ಮ್ -> ಂ
     s = re.sub(r"ಮ್$", "ಂ", s)
     s = re.sub(r"್$", "", s)
-    # Normalize trailing ೂರು / ೂರ -> ುರ
     s = re.sub(r"ೂರು$", "ುರ", s)
     s = re.sub(r"ೂರ$", "ುರ", s)
-    # Normalize long vowel signs to short vowel signs
     vowel_map = str.maketrans({
         "ೀ": "ಿ",
         "ೂ": "ು",
@@ -259,7 +252,6 @@ def kannada_phonetic_key(s: str) -> str:
         "ಊ": "ಉ",
         "ಏ": "ಎ",
         "ಓ": "ಒ",
-        # Aspirated to unaspirated consonants
         "ಖ": "ಕ",
         "ಘ": "ಗ",
         "ಛ": "ಚ",
@@ -273,17 +265,11 @@ def kannada_phonetic_key(s: str) -> str:
         "ಷ": "ಶ",
     })
     s = s.translate(vowel_map)
-    # Strip trailing 'ಾ' (e.g., ಯಲಬುರ್ಗಾ vs ಯಲಬುರ್ಗ)
     s = re.sub(r"ಾ$", "", s)
     return s
 
 
 def unify_similar_names(series: pd.Series, preserve_slash: bool = True) -> pd.Series:
-    """
-    Groups similar place names (like ಕಮಲಾಪುರ and ಕಮಲಾಪೂರ) under the most frequent
-    spelling in the dataset. Leaves combined entries with '/' (like ಕೊಲ್ಹಾರ/ ಬಸವನ ಬಾಗೇವಾಡಿ)
-    untouched when preserve_slash=True.
-    """
     val_counts = series.value_counts()
     canonical_map = {}
     phonetic_to_canonical = {}
@@ -294,7 +280,6 @@ def unify_similar_names(series: pd.Series, preserve_slash: bool = True) -> pd.Se
             canonical_map[val] = "N/A"
             continue
 
-        # Leave entries with '/' (two taluks) untouched as requested
         if preserve_slash and "/" in val:
             canonical_map[val] = val
             continue
@@ -304,12 +289,10 @@ def unify_similar_names(series: pd.Series, preserve_slash: bool = True) -> pd.Se
             canonical_map[val] = val
             continue
 
-        # 1. Exact phonetic/vowel-length match (catches ಕಮಲಾಪುರ vs ಕಮಲಾಪೂರ)
         if pkey in phonetic_to_canonical:
             canonical_map[val] = phonetic_to_canonical[pkey]
             continue
 
-        # 2. Check 1-character typo against existing canonical names (same starting letter)
         val_nospace = re.sub(r"\s+", "", val)
         matched_canon = None
         for canon in canonical_list:
@@ -393,31 +376,18 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
         c_nospace = c_clean.replace(" ", "")
         c_upper = c_clean.upper()
 
-        # 1. S/F Filter
         if re.search(r"\bS\s*/\s*F\b", c_upper) or c_upper == "S/F":
             col_mapping.setdefault(COL_SF, col)
-
-        # 2. Progress Status (CP/CF)
         elif "CP/CF" in c_upper or re.search(r"CP\s*/\s*CF", c_upper):
             col_mapping.setdefault(COL_PROGRESS, col)
-
-        # 3. ಲೆಕ್ಕ ಶೀರ್ಷಿಕೆ
         elif "ಲೆಕ್ಕಶೀರ್ಷಿಕೆ" in c_nospace or "ಲೆಕ್ಕಶಿರ್ಷಿಕೆ" in c_nospace or "ಲೆಕ್ಕ" in c_nospace:
             col_mapping.setdefault(COL_HEAD, col)
-
-        # 4. ವಿಭಾಗದ ಹೆಸರು
         elif "ವಿಭಾಗದಹೆಸರು" in c_nospace or c_clean == "ವಿಭಾಗ":
             col_mapping.setdefault(COL_DIVISION, col)
-
-        # 5. ಜಿಲ್ಲೆ
         elif c_nospace == "ಜಿಲ್ಲೆ" or "ಜಿಲ್ಲೆಯಹೆಸರು" in c_nospace or c_nospace.startswith("ಜಿಲ್ಲೆ"):
             col_mapping.setdefault(COL_DISTRICT, col)
-
-        # 6. ತಾಲ್ಲೂಕು
         elif any(t in c_nospace for t in ["ತಾಲ್ಲೂಕು", "ತಾಲೂಕು", "ತಾಲ್ಲುಕು", "ತಾಲೂಕ"]):
             col_mapping.setdefault(COL_TALUK, col)
-
-        # 7. ಮತಕ್ಷೇತ್ರ (Catches ಮತಕ್ಷೇತ್ರ, ಮತಕ್ಷೆತ್ರ, ಮತ ಕ್ಷೇತ್ರ, ವಿಧಾನಸಭಾ ಕ್ಷೇತ್ರ, ಕ್ಷೇತ್ರ)
         elif (
             "ಮತಕ್ಷ" in c_nospace
             or "ವಿಧಾನಸಭ" in c_nospace
@@ -429,8 +399,6 @@ def detect_and_map_columns(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
             )
         ):
             col_mapping.setdefault(COL_CONSTITUENCY, col)
-
-        # 8. Financial Columns
         elif "ಮೂಲಅಂದಾಜುಮೊತ್ತ" in c_nospace:
             col_mapping.setdefault(COL_EST_AMT, col)
         elif "ಗುತ್ತಿಗೆಮೊತ್ತ" in c_nospace:
@@ -504,16 +472,11 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
     if header_row_idx is not None:
         headers = [clean_text(v) for v in raw_df.iloc[header_row_idx].values]
 
-        # If header cells are merged vertically with the row above, inherit non-empty labels
         if header_row_idx > 0:
             prev_row = [clean_text(v) for v in raw_df.iloc[header_row_idx - 1].values]
-            non_empty_prev = sum(1 for x in prev_row if x)
-            if non_empty_prev >= 3:
-                headers = [
-                    h if h else p for h, p in zip(headers, prev_row)
-                ]
+            if sum(1 for x in prev_row if x) >= 3:
+                headers = [h if h else p for h, p in zip(headers, prev_row)]
 
-        # Combine sub-headers in the row immediately below if it is not a data row
         data_start_idx = header_row_idx + 1
         if header_row_idx + 1 < len(raw_df):
             next_row = [clean_text(v) for v in raw_df.iloc[header_row_idx + 1].values]
@@ -563,17 +526,111 @@ def parse_single_sheet(raw_df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
 
 
 # ==============================================================================
-# 4. PERSISTENT SNAPSHOT ENGINE (LOADS INSTANTLY ON APP OPEN)
+# 4. TIMEOUT-PROOF SHEET FETCHER WITH LIVE PROGRESS BAR
 # ==============================================================================
+def finalize_and_save_snapshot(
+    loaded_frames: list[pd.DataFrame], loaded_sheets: list[str], missing_sheets: list[str]
+) -> dict:
+    if loaded_frames:
+        combined_df = pd.concat(loaded_frames, ignore_index=True)
+        combined_df[COL_TALUK] = unify_similar_names(combined_df[COL_TALUK], preserve_slash=True)
+        combined_df[COL_DISTRICT] = unify_similar_names(combined_df[COL_DISTRICT], preserve_slash=True)
+        combined_df[COL_CONSTITUENCY] = unify_similar_names(
+            combined_df[COL_CONSTITUENCY], preserve_slash=True
+        )
+    else:
+        combined_df = pd.DataFrame()
+
+    ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime(
+        "%d-%m-%Y %I:%M %p IST"
+    )
+
+    snapshot_payload = {
+        "df": combined_df,
+        "loaded_sheets": sorted(loaded_sheets),
+        "missing_sheets": missing_sheets,
+        "timestamp": ist_now,
+    }
+
+    if not combined_df.empty:
+        try:
+            with open(SNAPSHOT_FILE, "wb") as f:
+                pickle.dump(snapshot_payload, f)
+        except Exception:
+            pass
+
+    return snapshot_payload
+
+
+def fetch_single_sheet_with_retry(sheet_id: str, sheet_name: str) -> pd.DataFrame | None:
+    """
+    Downloads ONLY the requested sheet as CSV using Google's gviz endpoint.
+    Completely bypasses 'doc-0g-9c-sheets.googleusercontent.com' full-xlsx export timeout!
+    """
+    candidates = [sheet_name]
+    if sheet_name.strip() != sheet_name:
+        candidates.append(sheet_name.strip())
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    for attempt in range(3):
+        for cand in candidates:
+            url = (
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+                f"/gviz/tq?tqx=out:csv&sheet={quote(cand)}"
+            )
+            try:
+                resp = requests.get(url, headers=headers, timeout=(10, 25))
+                if resp.status_code == 200:
+                    text_data = resp.content.decode("utf-8", errors="replace")
+                    if not text_data.lstrip().startswith("<!DOCTYPE html"):
+                        raw_df = pd.read_csv(
+                            io.StringIO(text_data),
+                            header=None,
+                            dtype=str,
+                            on_bad_lines="skip",
+                        )
+                        return parse_single_sheet(raw_df, sheet_name.strip())
+            except Exception:
+                pass
+        time.sleep(0.6 * (attempt + 1))
+
+    return None
+
+
 def download_and_build_snapshot(sheet_url: str) -> dict:
-    """Downloads fresh data from Google Sheets, unifies typos, and saves to disk snapshot."""
+    """
+    Downloads the 20 target sheets sequentially with a visible live progress bar
+    so it never triggers Google's full-workbook xlsx export timeout.
+    """
     sheet_id = extract_sheet_id(sheet_url)
-    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+    loaded_frames = []
+    loaded_sheets = []
+    missing_sheets = []
 
-    response = requests.get(export_url, timeout=60)
-    response.raise_for_status()
+    progress_bar = st.sidebar.progress(0, text="ಗೂಗಲ್ ಶೀಟ್‌ಗೆ ಸಂಪರ್ಕಿಸಲಾಗುತ್ತಿದೆ...")
+    total = len(TARGET_SHEETS)
 
-    excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
+    for idx, s_name in enumerate(TARGET_SHEETS, start=1):
+        progress_bar.progress(
+            idx / total,
+            text=f"📥 ಲೋಡ್ ಆಗುತ್ತಿದೆ ({idx}/{total}): {s_name.strip()}",
+        )
+        parsed_df = fetch_single_sheet_with_retry(sheet_id, s_name)
+        if parsed_df is not None:
+            loaded_sheets.append(s_name.strip())
+            if not parsed_df.empty:
+                loaded_frames.append(parsed_df)
+        else:
+            missing_sheets.append(s_name.strip())
+
+    progress_bar.empty()
+    return finalize_and_save_snapshot(loaded_frames, loaded_sheets, missing_sheets)
+
+
+def build_snapshot_from_uploaded_excel(file_bytes: bytes) -> dict:
+    """Builds and saves the snapshot directly from an uploaded .xlsx file in 2 seconds."""
+    excel_file = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     available_map = {str(name).strip().lower(): name for name in excel_file.sheet_names}
 
     loaded_frames = []
@@ -600,44 +657,11 @@ def download_and_build_snapshot(sheet_url: str) -> dict:
         else:
             missing_sheets.append(target)
 
-    if loaded_frames:
-        combined_df = pd.concat(loaded_frames, ignore_index=True)
-        # Unify similar spellings in Taluk (preserving '/' entries), District, and Constituency
-        combined_df[COL_TALUK] = unify_similar_names(combined_df[COL_TALUK], preserve_slash=True)
-        combined_df[COL_DISTRICT] = unify_similar_names(combined_df[COL_DISTRICT], preserve_slash=True)
-        combined_df[COL_CONSTITUENCY] = unify_similar_names(
-            combined_df[COL_CONSTITUENCY], preserve_slash=True
-        )
-    else:
-        combined_df = pd.DataFrame()
-
-    ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime(
-        "%d-%m-%Y %I:%M %p IST"
-    )
-
-    snapshot_payload = {
-        "df": combined_df,
-        "loaded_sheets": sorted(loaded_sheets),
-        "missing_sheets": missing_sheets,
-        "timestamp": ist_now,
-    }
-
-    # Save snapshot to local disk so future visits load instantaneously
-    try:
-        with open(SNAPSHOT_FILE, "wb") as f:
-            pickle.dump(snapshot_payload, f)
-    except Exception:
-        pass
-
-    return snapshot_payload
+    return finalize_and_save_snapshot(loaded_frames, loaded_sheets, missing_sheets)
 
 
 @st.cache_data(show_spinner=False)
-def get_active_snapshot(sheet_url: str) -> dict:
-    """
-    Loads the saved snapshot from disk instantaneously if available.
-    Only downloads from Google Sheets if no snapshot file exists yet.
-    """
+def load_saved_snapshot_from_disk() -> dict | None:
     if os.path.exists(SNAPSHOT_FILE):
         try:
             with open(SNAPSHOT_FILE, "rb") as f:
@@ -646,8 +670,7 @@ def get_active_snapshot(sheet_url: str) -> dict:
                 return data
         except Exception:
             pass
-
-    return download_and_build_snapshot(sheet_url)
+    return None
 
 
 # ==============================================================================
@@ -675,8 +698,20 @@ def main():
             "🔄 ಹೊಸ ಡೇಟಾ ರಿಫ್ರೆಶ್ ಮಾಡಿ (Update Snapshot)",
             type="primary",
             use_container_width=True,
-            help="ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ ತಾಜಾ ಡೇಟಾ ತಂದು ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸೇವ್ ಮಾಡಲು ಮಾತ್ರ ಇದನ್ನು ಒತ್ತಿ.",
+            help="ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ 20 ಶೀಟ್‌ಗಳನ್ನು ಒಂದೊಂದಾಗಿ ವೇಗವಾಗಿ ಲೋಡ್ ಮಾಡಿ ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸೇವ್ ಮಾಡುತ್ತದೆ.",
         )
+
+        with st.expander("📤 ಪರ್ಯಾಯ: Excel (.xlsx) ಫೈಲ್ ಅಪ್‌ಲೋಡ್"):
+            uploaded_xlsx = st.file_uploader(
+                "ಗೂಗಲ್ ಶೀಟ್ ನಿಧಾನವಾಗಿದ್ದರೆ ನೇರವಾಗಿ .xlsx ಫೈಲ್ ಇಲ್ಲಿ ಹಾಕಿ (2 ಸೆಕೆಂಡಿನಲ್ಲಿ ಅಪ್‌ಡೇಟ್ ಆಗುತ್ತದೆ)",
+                type=["xlsx"],
+            )
+            if uploaded_xlsx is not None:
+                if st.button("✅ ಅಪ್‌ಲೋಡ್ ಮಾಡಿದ ಫೈಲ್‌ನಿಂದ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸೇವ್ ಮಾಡಿ", use_container_width=True):
+                    with st.spinner("ಎಕ್ಸೆಲ್ ಫೈಲ್ ಪ್ರಕ್ರಿಯೆಗೊಳಿಸಲಾಗುತ್ತಿದೆ..."):
+                        snapshot = build_snapshot_from_uploaded_excel(uploaded_xlsx.read())
+                        st.cache_data.clear()
+                        st.success("✅ ಎಕ್ಸೆಲ್ ಫೈಲ್‌ನಿಂದ ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸೇವ್ ಆಗಿದೆ!")
 
         unit_mode = st.selectbox(
             "ಮೊತ್ತದ ಘಟಕ",
@@ -684,23 +719,30 @@ def main():
             index=0,
         )
 
-    # If user clicks Refresh, rebuild snapshot from Google Sheets and overwrite disk cache
-    if refresh_clicked:
-        with st.spinner("ಗೂಗಲ್ ಶೀಟ್‌ನಿಂದ ಹೊಸ ಡೇಟಾ ಸಿಂಕ್ ಮಾಡಲಾಗುತ್ತಿದೆ..."):
-            try:
-                snapshot = download_and_build_snapshot(sheet_url_input)
+    # 1. Load existing snapshot from disk first (instantaneous)
+    snapshot = load_saved_snapshot_from_disk()
+
+    # 2. If user clicked Refresh OR no snapshot exists on disk yet, fetch sheet-by-sheet
+    if refresh_clicked or snapshot is None:
+        try:
+            new_snapshot = download_and_build_snapshot(sheet_url_input)
+            if not new_snapshot["df"].empty:
+                snapshot = new_snapshot
                 st.cache_data.clear()
-                st.sidebar.success("✅ ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಯಶಸ್ವಿಯಾಗಿ ಸೇವ್ ಆಗಿದೆ!")
-            except Exception as e:
-                st.sidebar.error(f"ರಿಫ್ರೆಶ್ ದೋಷ: {e}")
+                if refresh_clicked:
+                    st.sidebar.success("✅ ಹೊಸ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಯಶಸ್ವಿಯಾಗಿ ಸೇವ್ ಆಗಿದೆ!")
+            elif snapshot is not None:
+                st.sidebar.warning("⚠️ ಗೂಗಲ್ ಸರ್ವರ್ ನಿಧಾನವಾಗಿದೆ; ಹಿಂದಿನ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಡೇಟಾವನ್ನೇ ತೋರಿಸಲಾಗುತ್ತಿದೆ.")
+        except Exception as e:
+            if snapshot is not None:
+                st.sidebar.warning(f"⚠️ ರಿಫ್ರೆಶ್ ಸಾಧ್ಯವಾಗಲಿಲ್ಲ ({e}). ಹಿಂದಿನ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಡೇಟಾ ಲಭ್ಯವಿದೆ.")
+            else:
+                st.error(f"ಡೇಟಾ ಲೋಡ್ ಮಾಡುವಲ್ಲಿ ದೋಷ: {e}")
                 st.stop()
-    else:
-        with st.spinner("ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಡೇಟಾ ಲೋಡ್ ಆಗುತ್ತಿದೆ..."):
-            try:
-                snapshot = get_active_snapshot(sheet_url_input)
-            except Exception as e:
-                st.error(f"ಡೇಟಾ ಲೋಡ್ ಮಾಡುವಲ್ಲಿ ದೋಷ ಕಂಡುಬಂದಿದೆ: {e}")
-                st.stop()
+
+    if snapshot is None or snapshot["df"].empty:
+        st.warning("ನಿಗದಿಪಡಿಸಿದ 8 ವಿಭಾಗಗಳಿಗೆ ಸಂಬಂಧಿಸಿದ ಯಾವುದೇ ಕಾಮಗಾರಿಗಳ ಮಾಹಿತಿ ಕಂಡುಬಂದಿಲ್ಲ.")
+        st.stop()
 
     df = snapshot["df"]
     loaded_sheets = snapshot["loaded_sheets"]
@@ -709,7 +751,6 @@ def main():
 
     st.sidebar.caption(f"📸 **ಕೊನೆಯ ಸ್ನ್ಯಾಪ್‌ಶಾಟ್ ಸಮಯ:** {snap_time}")
 
-    # Optional: allow downloading snapshot_data.pkl to commit to GitHub for 100% permanent storage
     if os.path.exists(SNAPSHOT_FILE):
         with open(SNAPSHOT_FILE, "rb") as f:
             st.sidebar.download_button(
@@ -718,12 +759,8 @@ def main():
                 file_name="snapshot_data.pkl",
                 mime="application/octet-stream",
                 use_container_width=True,
-                help="ಈ ಫೈಲ್ ಅನ್ನು GitHub ರೆಪೊಸಿಟರಿಯಲ್ಲಿ ಸೇರಿಸಿದರೆ ಸರ್ವರ್ ರೀಸ್ಟಾರ್ಟ್ ಆದರೂ ಡೇಟಾ ಶಾಶ್ವತವಾಗಿ ಇರುತ್ತದೆ.",
+                help="ಈ snapshot_data.pkl ಫೈಲ್ ಅನ್ನು GitHub ನಲ್ಲಿ ಅಪ್‌ಲೋಡ್ ಮಾಡಿದರೆ ಸರ್ವರ್ ರೀಸ್ಟಾರ್ಟ್ ಆದರೂ ಡೇಟಾ ಶಾಶ್ವತವಾಗಿ ಇರುತ್ತದೆ.",
             )
-
-    if df.empty:
-        st.warning("ನಿಗದಿಪಡಿಸಿದ 8 ವಿಭಾಗಗಳಿಗೆ ಸಂಬಂಧಿಸಿದ ಯಾವುದೇ ಕಾಮಗಾರಿಗಳ ಮಾಹಿತಿ ಕಂಡುಬಂದಿಲ್ಲ.")
-        st.stop()
 
     # ==========================================================================
     # 6. SIDEBAR FILTERS
