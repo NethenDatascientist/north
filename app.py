@@ -863,7 +863,7 @@ def main():
     )
 
     with tab1:
-        st.markdown(f"#### ವಿಭಾಗವಾರು ಗೋಷ್ಟ್ವಾರೆ ({unit_suffix}ಗಳಲ್ಲಿ)")
+        st.markdown(f"#### ವಿಭಾಗವಾರು ಘೋಷ್ವಾರೆ ({unit_suffix})")
         div_group = (
             filtered_df.groupby(COL_DIVISION, as_index=False)
             .agg(
