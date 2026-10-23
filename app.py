@@ -817,7 +817,7 @@ def main():
     total_works = len(filtered_df)
     sums = {col: filtered_df[col].sum() / divisor for col in FINANCIAL_COLUMNS}
 
-    st.subheader(f"📌 ಪ್ರಮುಖ ಅಂಕಿಅಂಶಗಳು ({unit_suffix}ಗಳಲ್ಲಿ)")
+    st.subheader(f"📌 ಪ್ರಮುಖ ಅಂಕಿಅಂಶಗಳು ({unit_suffix})")
 
     kpi_items = [
         ("ಒಟ್ಟು ಕಾಮಗಾರಿಗಳ ಸಂಖ್ಯೆ", f"{total_works:,}", "ಒಟ್ಟು ಕಾಮಗಾರಿಗಳು", True),
